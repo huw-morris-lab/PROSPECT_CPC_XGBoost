@@ -1,0 +1,319 @@
+# Import dataset in raw CSV format (named PROSPECT_CPC)
+
+
+```{r Load libraries}
+# Load libraries recommended based on functions needed
+
+library(tidyverse)
+library(stringr)
+library(nabor)
+library(tidyr)
+library(tidyselect)
+library(naniar)
+library(dplyr)
+library(stats)
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::rename)
+library(tidymodels)
+library(dplyr)
+library(xgboost)
+library(vip)
+library(pdp)
+
+
+```
+
+```{r Data preparation for using ML}
+
+PSP_ML <- PROSPECT_CPC %>% 
+  dplyr::mutate(
+    PSP_Px = ifelse(path_diagnosis_1 == "PSP", 1, 0),
+    CBD_Px = ifelse(path_diagnosis_1 == "CBD", 1, 0),
+    AD_Px  = ifelse(path_diagnosis_1 == "AD",  1, 0),
+    MSA_Px = ifelse(path_diagnosis_1 == "MSA", 1, 0)
+  ) %>% 
+  # Only select where we know most values should be non-missing
+  select(PSP_Px,
+         age_at_onset,
+         sex,
+         family_history_of_neurological_conditions,
+         disease_course_years,
+         updrs_speech, # 2.1
+         updrs_drooling,  #2.2
+         updrs_swallowing,  #2.3
+         updrs_eating_tasks,  #2.4
+         updrs_dressing,  #2.5
+         updrs_hygeine, #2.6
+         updrs_handwriting,  #2.7
+         updrs_hobbies, #2.8
+         updrs_turning_in_bed, #2.9
+         updrs_tremor,  #2.10
+         updrs_out_of_chair,  #2.11
+         updrs_walking_balance, #2.12
+         updrs_freezing, #2.13
+         UPDRS_II_scaled,
+         starts_with("kcf"),
+         starts_with("fs_"),
+         starts_with("CBI"),
+         -CBI) %>% 
+  # Only select variables which have <10% missing values
+  select(where(~ sum(is.na(.)) <11)) %>% 
+  # convert all variables to numeric
+  mutate(
+    across(
+      c(starts_with("kcf"), family_history_of_neurological_conditions),
+      ~ case_when(
+        . == "yes" ~ 1,
+        . == "no"  ~ 0,
+        TRUE       ~ NA_real_
+      ))) %>% 
+  mutate(sex = case_when(sex == "M" ~ 1,
+                         sex == "F" ~ 0)) %>% 
+  mutate
+
+
+
+```
+
+```{r Imputation of binary vairables using kNN, include=FALSE}
+
+library(VIM)
+
+
+# Suppose your binary variables are named bin1, bin2...
+# Force them back to 0/1
+# Your manually defined binary variable list
+bin_vars <- c(
+  'family_history_of_neurological_conditions',
+  'kcf_asymmetry',
+  'kcf_falls',
+  'kcf_autonomic',
+  'kcf_fluency',
+  'kcf_personality',
+  'kcf_amnesia',
+  'kcf_hallucinations',
+  'kcf_visuospatial',
+  'kcf_rigidity',
+  'kcf_dysarthria',
+  'kcf_rbd',
+  'fs_gait_disorder',
+  'fs_writing_difficulties',
+  'fs_hand_difficulties',
+  'fs_falls_balance',
+  'fs_other',
+  'fs_alien_limb',
+  'fs_stiffness',
+  'fs_speech',
+  'fs_incoordination',
+  'fs_behavioural',
+  'fs_sensations',
+  'fs_dizziness',
+  'fs_urinary_dysfunction',
+  'fs_visual_disturbance',
+  'fs_libido_disturbance',
+  'fs_tremor',
+  'fs_autonomic'
+)
+
+library(VIM)
+
+impute_knn_binary <- function(data, bin_vars, k = 5) {
+  # Run KNN imputation
+  imp <- kNN(data, k = k)
+  
+  # Remove extra *_imp columns
+  imp <- imp[ , !grepl("_imp$", names(imp))]
+  
+  # Convert imputed values in *manually specified* binary vars back to 0/1
+  imp[bin_vars] <- lapply(imp[bin_vars], function(x) ifelse(x > 0.5, 1, 0))
+  
+  return(imp)
+}
+
+
+
+# Factor variables where needed
+
+PSP_ML_imp <- PSP_ML %>%
+  impute_knn_binary(bin_vars, k = 5) %>%
+  mutate(PSP_Px = factor(PSP_Px, levels = c(0,1), labels = c("No","Yes")))
+
+
+
+```
+
+```{r Repeated 10-fold cross-validation}
+
+set.seed(123)
+folds <- vfold_cv(PSP_ML_imp, v = 10, repeats = 5)  # 10 folds × 5 repeats
+
+```
+
+```{r Preprocessing Recipe}
+
+rec <- recipe(PSP_Px ~ ., data = PSP_ML_imp) %>%
+  step_zv(all_predictors())  # remove zero variance predictors
+
+```
+
+```{r XGBoost Model Specification}
+
+xgb_spec <- boost_tree(
+  trees = 1000,        # number of trees
+  tree_depth = 6,      # max depth per tree
+  learn_rate = 0.01,   # learning rate (shrinkage)
+  loss_reduction = 0,  # gamma
+  sample_size = 1,     # subsampling
+  mtry = NULL,         # number of predictors randomly sampled at each split (NULL = all)
+  min_n = 1            # min number of data points in a node
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+```{r Workflow and Model Training}
+
+wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(xgb_spec)
+
+```
+
+```{r Fit with Repeated 10-Fold CV}
+
+set.seed(123)
+xgb_res <- wf %>%
+  fit_resamples(
+    resamples = folds,
+    metrics = metric_set(accuracy, roc_auc, sens, yardstick::spec),
+    control = control_resamples(save_pred = TRUE))
+
+```
+
+```{r Evaluate Accuracy and ROC AUC}
+
+collect_metrics(xgb_res)
+
+```
+
+```{r Refit workflow on entire dataset}
+
+# Refit on full data
+final_fit <- wf %>%
+  fit(data = PSP_ML_imp)
+
+fit_xgb <- extract_fit_parsnip(final_fit)$fit
+
+```
+
+```{r Optional: Test Top-N VIP Features}
+
+importance_df <- xgb.importance(model = fit_xgb)
+
+top10 <- importance_df %>%
+  slice_max(order_by = Gain, n = 10)
+
+top10 %>% select(Feature, Gain, Cover, Frequency)
+
+```
+
+```{r Directionality of predictors}
+
+direction_df <- top10$Feature %>%
+  setNames(., .) %>%
+  lapply(function(f) {
+    df <- PSP_ML_imp %>% select(all_of(f), PSP_Px)
+    
+    means <- df %>%
+      group_by(PSP_Px) %>%
+      summarise(mean_val = mean(.data[[f]], na.rm = TRUE))
+    
+    # Compute direction: +1 if higher in Yes, -1 if lower
+    direction <- sign(means$mean_val[means$PSP_Px == "Yes"] -
+                        means$mean_val[means$PSP_Px == "No"])
+    return(direction)
+  }) %>%
+  unlist()
+
+direction_df
+
+```
+
+```{r Plot with directionality}
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+# ---- 1. Scale top feature to 1 ----
+top10 <- top10 %>%
+  mutate(Gain_rel = Gain / max(Gain))
+
+# ---- 2. Red / blue groups (based on original Feature names) ----
+red_features  <- c(
+  "cbi_scaled",
+  "age_at_onset",
+  "updrs_handwriting",
+  "kcf_falls",
+  "cbi_23",
+  "cbi_9",
+  "fs_falls_balance",
+  "updrs_hobbies"
+)
+
+blue_features <- c(
+  "disease_course_years",
+  "updrs_tremor"
+)
+
+top10_plot <- top10 %>%
+  filter(Feature %in% c(red_features, blue_features)) %>%
+  mutate(Direction = case_when(
+    Feature %in% red_features  ~ "Positive predictor",
+    Feature %in% blue_features ~ "Negative predictor"
+  ))
+
+# ---- 3. Custom labels for axis ----
+feature_labels <- c(
+  "cbi_scaled" = "CBI total score",
+  "age_at_onset" = "Age at symptom onset",
+  "updrs_tremor" = "Tremor severity (source: MDS-UPDRS)",
+  "disease_course_years" = "Total disease course (years)",
+  "kcf_falls" = "Falls (KCF)",
+  "updrs_handwriting" = "Impaired handwriting (source: MDS-UPDRS)",
+  "cbi_23" = "Restlessness or agitation (source: CBI)",
+  "fs_falls_balance" = "Falls or balance impairment as first symptom",
+  "cbi_9" = "Impulsivity (source: CBI)",
+  "updrs_hobbies" = "Trouble doing hobbies (source: MDS-UPDRS)"
+)
+
+# ---- 4. Color mapping ----
+color_mapping <- c(
+  "Positive predictor" = "red",
+  "Negative predictor" = "blue"
+)
+
+# ---- 5. Plot ----
+ggplot(top10_plot,
+       aes(x = fct_reorder(Feature, Gain_rel),
+           y = Gain_rel,
+           fill = Direction)) +
+  geom_col() +
+  geom_text(aes(label = round(Gain_rel, 2)),
+            hjust = -0.1, size = 3.5, color = "black") +
+  coord_flip() +
+  scale_fill_manual(values = color_mapping) +
+  scale_x_discrete(labels = feature_labels) +  # <-- custom labels here
+  labs(
+    title = "Top 10 XGBoost Features by Relative Gain",
+    x = "Feature",
+    y = "Relative Gain (Top Feature = 1)",
+    fill = "Predictor direction"
+  ) +
+  theme_minimal() +
+  expand_limits(y = 1.1)
+
+
+
+```
